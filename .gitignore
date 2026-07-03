@@ -1,0 +1,42 @@
+# Build output
+/build/
+/out/
+/bin/
+/x64/
+/x86/
+/Debug/
+/Release/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.ipch
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.cmake
+!CMakeLists.txt
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.opendb
+*.VC.db
+*.VC.VC.opendb
+
+# Windows/OS cruft
+Thumbs.db
+desktop.ini

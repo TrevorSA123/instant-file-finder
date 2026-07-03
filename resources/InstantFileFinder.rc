@@ -1,0 +1,6 @@
+#include <winuser.h>
+
+// Embeds app.manifest as the executable's manifest resource (DPI awareness, asInvoker
+// execution level, common-controls v6 dependency). Resource ID 1 / RT_MANIFEST is what
+// Windows looks for on the primary EXE manifest.
+1 24 "app.manifest"
