@@ -6,6 +6,8 @@ This project started partly as a practical tool and partly as a learning exercis
 
 The idea is simple: if the filesystem already has the metadata, then for many searches you should not need to wait for a slow recursive scan, or depend on Windows Search being enabled, up to date, or configured the way you want. This tool builds its own lightweight in-memory view of the filesystem, while still allowing live searching when no index has been built.
 
+![instant-file-finder](instant-file-finder.png)
+
 Written in raw Win32 C++17, built with CMake and MSVC.
 
 ## What it does
