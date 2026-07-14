@@ -52,16 +52,53 @@ bool PassesFilters(const IndexedItem& item, const SearchOptions& opts) {
         if (!StringUtil::ContainsIgnoreCase(item.fullPath, opts.pathSubstring)) return false;
     }
 
-    if (opts.sizeFilterEnabled) {
-        if (!item.sizeKnown) return false;
-        if (item.size < opts.minSize) return false;
-        if (opts.maxSize > 0 && item.size > opts.maxSize) return false;
-    }
+    // Size and modified-date filters. The active index often lacks this data: NTFS USN
+    // enumeration provides no file size at all, and its enumerated records' timestamps come back
+    // as zero (a full-volume enumeration isn't a real journal event), so a USN-built index has no
+    // usable modified time either. So for any item whose needed value is missing - treating a zero
+    // FILETIME as missing regardless of the stored "known" flag, which also repairs older caches
+    // that persisted a zero time as "known" - resolve it on demand with a single
+    // GetFileAttributesExW. IsMatch checks the cheap in-memory name match before calling this, so
+    // these stats run only for items that actually match the query, not the whole index.
+    if (opts.sizeFilterEnabled || opts.modifiedDateFilterEnabled) {
+        uint64_t size = item.size;
+        bool sizeKnown = item.sizeKnown;
+        FILETIME modifiedTime = item.modifiedTime;
+        bool modifiedKnown = item.modifiedTimeKnown &&
+                             (item.modifiedTime.dwLowDateTime != 0 || item.modifiedTime.dwHighDateTime != 0);
 
-    if (opts.modifiedDateFilterEnabled) {
-        if (!item.modifiedTimeKnown) return false;
-        if (FileTimeUtil::Compare(item.modifiedTime, opts.modifiedAfter) < 0) return false;
-        if (FileTimeUtil::Compare(item.modifiedTime, opts.modifiedBefore) > 0) return false;
+        bool needSize = opts.sizeFilterEnabled && !item.isDirectory && !sizeKnown;
+        bool needDate = opts.modifiedDateFilterEnabled && !modifiedKnown;
+        if (needSize || needDate) {
+            WIN32_FILE_ATTRIBUTE_DATA data{};
+            if (GetFileAttributesExW(item.fullPath.c_str(), GetFileExInfoStandard, &data)) {
+                bool statIsDir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                if (needSize && !statIsDir) {
+                    ULARGE_INTEGER sz{};
+                    sz.LowPart = data.nFileSizeLow;
+                    sz.HighPart = data.nFileSizeHigh;
+                    size = sz.QuadPart;
+                    sizeKnown = true;
+                }
+                if (needDate) {
+                    modifiedTime = data.ftLastWriteTime;
+                    modifiedKnown = true;
+                }
+            }
+        }
+
+        if (opts.sizeFilterEnabled) {
+            if (item.isDirectory) return false; // folders have no size to compare against
+            if (!sizeKnown) return false;
+            if (size < opts.minSize) return false;
+            if (opts.maxSize > 0 && size > opts.maxSize) return false;
+        }
+
+        if (opts.modifiedDateFilterEnabled) {
+            if (!modifiedKnown) return false;
+            if (FileTimeUtil::Compare(modifiedTime, opts.modifiedAfter) < 0) return false;
+            if (FileTimeUtil::Compare(modifiedTime, opts.modifiedBefore) > 0) return false;
+        }
     }
 
     return true;
@@ -84,10 +121,14 @@ bool TryCompileRegex(const SearchOptions& opts, std::wregex& outRegex, std::wstr
 }
 
 bool IsMatch(const IndexedItem& item, const SearchOptions& opts, const std::wregex* compiledRegex) {
-    return PassesFilters(item, opts) && MatchesName(item, opts, compiledRegex);
+    // Name match first: it's a cheap in-memory check, whereas PassesFilters may fall back to a
+    // per-file disk stat when a size/date filter is active against an index that lacks that data.
+    // Ordering the name match first means that stat only happens for items that actually match the
+    // query, instead of once per item across the whole index.
+    return MatchesName(item, opts, compiledRegex) && PassesFilters(item, opts);
 }
 
-SearchOutcome Execute(const ItemSource& source, const SearchOptions& opts) {
+SearchOutcome Execute(const ItemSource& source, const SearchOptions& opts, const CancelPredicate& isCancelled) {
     SearchOutcome outcome;
 
     std::wregex compiledRegex;
@@ -102,6 +143,7 @@ SearchOutcome Execute(const ItemSource& source, const SearchOptions& opts) {
     size_t maxResults = opts.maxResults > 0 ? opts.maxResults : 10000;
 
     source([&](const IndexedItem& item) {
+        if (isCancelled && isCancelled()) return;
         if (!IsMatch(item, opts, haveRegex ? &compiledRegex : nullptr)) return;
 
         ++outcome.totalMatched;

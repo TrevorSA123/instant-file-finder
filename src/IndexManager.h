@@ -83,14 +83,31 @@ private:
     void IndexOneDriveRawMft(wchar_t letter, DriveIndexStatus& status, const IndexOptions& options);
     void IndexOneDriveFast(wchar_t letter, DriveIndexStatus& status, const IndexOptions& options);
     void IndexOneDriveRecursive(wchar_t letter, DriveIndexStatus& status, const IndexOptions& options);
-    bool TryIncrementalUpdate(wchar_t letter, DriveIndexStatus& status);
+    enum class IncrementalResult {
+        Applied,       // journal changes were read and applied on top of the in-memory index
+        NotApplicable, // no in-memory index or no USN journal for this drive; nothing attempted
+        Failed,        // journal read failed or journal was invalidated; a full rescan is needed
+    };
+
+    // Manages its own locking: the USN journal read (disk I/O) runs with no lock held so the
+    // UI thread's status queries never block behind it; the lock is only taken briefly to
+    // snapshot journal identity and then to apply the decoded changes. 'appliedChangeCount'
+    // (optional) receives how many changes were applied, letting callers skip persisting an
+    // index whose contents did not actually change.
+    IncrementalResult TryIncrementalUpdate(wchar_t letter, size_t* appliedChangeCount = nullptr);
 
     void PostStatusChanged(wchar_t letter);
     void PostProgress(wchar_t letter, uint64_t count);
     bool IsCancelled() const { return m_cancelRequested.load(); }
 
     void SaveDriveCache(wchar_t letter);
-    bool LoadDriveCache(wchar_t letter, DriveIndexStatus& status);
+    // Rewrites only the fixed-size header of an existing cache file (journal position, built-at
+    // timestamp), leaving the item payload untouched. For when the in-memory index still matches
+    // the file contents but the journal position or timestamp advanced.
+    void UpdateDriveCacheHeader(wchar_t letter);
+    // Manages its own locking: the file parse (potentially hundreds of MB) runs unlocked so
+    // status queries from the UI thread don't block behind it.
+    bool LoadDriveCache(wchar_t letter);
     void DeleteDriveCache(wchar_t letter);
     std::wstring CacheFilePath(wchar_t letter) const;
 

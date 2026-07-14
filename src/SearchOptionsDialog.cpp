@@ -2,6 +2,7 @@
 #include "ModalLoop.h"
 #include "FormatUtil.h"
 #include "DpiUtil.h"
+#include "FileTimeUtil.h"
 
 #include <commctrl.h>
 #include <string>
@@ -215,10 +216,15 @@ bool Show(HWND owner, HINSTANCE instance, SearchOptions& options) {
         S(90), curY, S(150), S(24), hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DTP_BEFORE)), instance, nullptr);
     setFont(controls.dtpBefore);
 
-    SYSTEMTIME afterSt = options.modifiedDateFilterEnabled ? FileTimeToLocalSystemTime(options.modifiedAfter) : SYSTEMTIME{};
-    SYSTEMTIME beforeSt = options.modifiedDateFilterEnabled ? FileTimeToLocalSystemTime(options.modifiedBefore) : SYSTEMTIME{};
-    if (afterSt.wYear != 0) DateTime_SetSystemtime(controls.dtpAfter, GDT_VALID, &afterSt);
-    if (beforeSt.wYear != 0) DateTime_SetSystemtime(controls.dtpBefore, GDT_VALID, &beforeSt);
+    // Default to a 30-day range ending now rather than leaving the pickers unset: an unset
+    // DTP defaults to the current moment for *both* controls, which collapses the after/before
+    // range to a single instant and silently makes the date filter reject every real file.
+    SYSTEMTIME afterSt = options.modifiedDateFilterEnabled ? FileTimeToLocalSystemTime(options.modifiedAfter)
+                                                            : FileTimeToLocalSystemTime(FileTimeUtil::LocalMidnightDaysAgo(30));
+    SYSTEMTIME beforeSt = options.modifiedDateFilterEnabled ? FileTimeToLocalSystemTime(options.modifiedBefore)
+                                                             : FileTimeToLocalSystemTime(FileTimeUtil::Now());
+    DateTime_SetSystemtime(controls.dtpAfter, GDT_VALID, &afterSt);
+    DateTime_SetSystemtime(controls.dtpBefore, GDT_VALID, &beforeSt);
 
     curY += S(45);
     int btnWidth = S(85), btnHeight = S(28);

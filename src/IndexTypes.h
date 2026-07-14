@@ -22,6 +22,10 @@ struct IndexedItem {
 
     uint64_t size = 0;
     bool sizeKnown = false;
+    // True while a folder's recursive size is being computed in the background (see
+    // FolderSizeCalculator). Only meaningful when isDirectory is true; lets the results list show
+    // "Calculating..." instead of "unknown" while a folder's size is pending.
+    bool sizePending = false;
 
     FILETIME createdTime{};
     bool createdTimeKnown = false;

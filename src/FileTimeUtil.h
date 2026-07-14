@@ -18,4 +18,8 @@ FILETIME StartOfThisWeekLocal();
 // Formats a FILETIME as "YYYY-MM-DD HH:MM" in local time. Returns L"" if unknown/zero.
 std::wstring Format(const FILETIME& ft, bool known);
 
+// Formats how long ago 'ft' was as a coarse human-readable string, e.g. "just now",
+// "5 minutes ago", "2 hours ago", "3 days ago". Returns L"" if unknown/zero/in the future.
+std::wstring FormatAge(const FILETIME& ft, bool known);
+
 } // namespace FileTimeUtil

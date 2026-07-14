@@ -34,7 +34,7 @@ const wchar_t* ScanMethodDisplayName(ScanMethod method) {
     }
 }
 
-void WriteWString(std::ofstream& out, const std::wstring& s) {
+void WriteWString(std::ostream& out, const std::wstring& s) {
     uint32_t len = static_cast<uint32_t>(std::min<size_t>(s.size(), kMaxStringLen));
     out.write(reinterpret_cast<const char*>(&len), sizeof(len));
     if (len > 0) {
@@ -55,7 +55,7 @@ bool ReadWString(std::ifstream& in, std::wstring& s) {
 }
 
 template <typename T>
-void WriteRaw(std::ofstream& out, const T& value) {
+void WriteRaw(std::ostream& out, const T& value) {
     out.write(reinterpret_cast<const char*>(&value), sizeof(T));
 }
 
@@ -253,39 +253,68 @@ void IndexManager::IndexOneDrive(wchar_t letter, bool forceRebuild, const IndexO
     // A journal ID/next-USN was captured at build time regardless of which method built the
     // index (both NtfsUsnIndexer and RawMftIndexer query FSCTL_QUERY_USN_JOURNAL), so an
     // incremental refresh doesn't need to repeat whichever expensive full scan built it.
-    bool usedIncremental = false;
     bool scanMethodSupportsIncremental =
         statusCopy.scanMethod == ScanMethod::FastNtfsUsn || statusCopy.scanMethod == ScanMethod::RawMft;
-    if (!forceRebuild && scanMethodSupportsIncremental && options.useIncrementalUsnUpdates) {
-        std::unique_lock lock(m_mutex);
-        auto* status = FindStatusLocked(letter);
-        if (status != nullptr && status->indexed && status->hasUsnJournal) {
-            usedIncremental = TryIncrementalUpdate(letter, *status);
-        }
+    bool incrementalAllowed = !forceRebuild && scanMethodSupportsIncremental && options.useIncrementalUsnUpdates;
+
+    size_t incrementalChanges = 0;
+    bool usedIncremental = false;
+    if (incrementalAllowed) {
+        usedIncremental = TryIncrementalUpdate(letter, &incrementalChanges) == IncrementalResult::Applied;
     }
 
-    // Tracks whether the index we ended up with came straight from an on-disk cache (in which
-    // case its "last indexed" timestamp reflects when the cache was originally built, not now).
+    // Tracks whether the index we ended up with came straight from an on-disk cache, and
+    // whether journal changes were then replayed on top of it to bring it current.
     bool loadedFromDiskCache = false;
+    bool cacheCaughtUp = false;
 
     if (!usedIncremental) {
-        std::unique_lock lock(m_mutex);
-        auto* status = FindStatusLocked(letter);
-        if (status == nullptr) return;
-
         // A cache on disk can satisfy this without a rescan if it's still valid and the caller
         // did not explicitly request a rebuild.
-        bool loadedFromDisk = false;
-        if (!forceRebuild && options.persistIndexCache && !status->indexed) {
-            loadedFromDisk = LoadDriveCache(letter, *status);
-        }
-        loadedFromDiskCache = loadedFromDisk;
+        if (!forceRebuild && options.persistIndexCache && !statusCopy.indexed) {
+            {
+                std::unique_lock lock(m_mutex);
+                if (auto* status = FindStatusLocked(letter)) {
+                    status->statusMessage = L"Loading index cache...";
+                }
+            }
+            PostStatusChanged(letter);
+            loadedFromDiskCache = LoadDriveCache(letter);
 
-        if (!loadedFromDisk) {
-            ScanMethod method = status->scanMethod;
-            DriveIndexStatus statusForScan = *status;
-            statusForScan.downgradeReason.clear();
-            lock.unlock();
+            // The cache stores the journal position it was built at, so changes made while the
+            // app wasn't running can be replayed on top of it - startup then yields a current
+            // index instead of one exactly as stale as the file on disk.
+            if (loadedFromDiskCache && incrementalAllowed) {
+                {
+                    std::unique_lock lock(m_mutex);
+                    if (auto* status = FindStatusLocked(letter)) {
+                        status->statusMessage = L"Applying journal changes...";
+                    }
+                }
+                PostStatusChanged(letter);
+                IncrementalResult catchUp = TryIncrementalUpdate(letter, &incrementalChanges);
+                if (catchUp == IncrementalResult::Applied) {
+                    cacheCaughtUp = true;
+                } else if (catchUp == IncrementalResult::Failed) {
+                    // The cache can't be trusted as current (journal wrapped or unreadable);
+                    // fall through to a full rescan as if the cache had missed entirely.
+                    loadedFromDiskCache = false;
+                }
+            }
+        }
+
+        if (!loadedFromDiskCache) {
+            ScanMethod method;
+            DriveIndexStatus statusForScan;
+            {
+                std::unique_lock lock(m_mutex);
+                auto* status = FindStatusLocked(letter);
+                if (status == nullptr) return;
+                status->statusMessage = L"Indexing...";
+                method = status->scanMethod;
+                statusForScan = *status;
+                statusForScan.downgradeReason.clear();
+            }
 
             if (method == ScanMethod::Disabled) {
                 statusForScan.statusMessage = L"Disabled";
@@ -293,7 +322,7 @@ void IndexManager::IndexOneDrive(wchar_t letter, bool forceRebuild, const IndexO
                 IndexOneDriveCascade(letter, statusForScan, options, method);
             }
 
-            std::unique_lock lock2(m_mutex);
+            std::unique_lock lock(m_mutex);
             if (auto* s = FindStatusLocked(letter)) {
                 *s = statusForScan;
             }
@@ -308,11 +337,12 @@ void IndexManager::IndexOneDrive(wchar_t letter, bool forceRebuild, const IndexO
             auto dataIt = m_driveData.find(letter);
             status->itemCount = (dataIt != m_driveData.end()) ? dataIt->second.items.size() : 0;
             if (status->errors.empty()) {
-                status->statusMessage = L"Indexed";
+                status->statusMessage = (loadedFromDiskCache && !cacheCaughtUp) ? L"Indexed (from cache)" : L"Indexed";
             }
-            // A fresh scan or a successful incremental sync both mean the index reflects the
-            // current moment; only a straight cache load keeps its original build timestamp.
-            if (!loadedFromDiskCache) {
+            // A fresh scan, a successful incremental sync, or a cache load brought current from
+            // the journal all mean the index reflects this moment; only a straight cache load
+            // with no catch-up keeps its original build timestamp.
+            if (!loadedFromDiskCache || cacheCaughtUp) {
                 status->lastIndexedTime = FileTimeUtil::Now();
                 status->lastIndexedTimeKnown = true;
             }
@@ -321,7 +351,17 @@ void IndexManager::IndexOneDrive(wchar_t letter, bool forceRebuild, const IndexO
     PostStatusChanged(letter);
 
     if (options.persistIndexCache) {
-        SaveDriveCache(letter);
+        bool freshScan = !usedIncremental && !loadedFromDiskCache;
+        bool appliedChanges = (usedIncremental || cacheCaughtUp) && incrementalChanges > 0;
+        if (freshScan || appliedChanges) {
+            SaveDriveCache(letter);
+        } else if (usedIncremental || cacheCaughtUp) {
+            // Item contents still match the file; persist just the advanced journal position
+            // and timestamp instead of rewriting a large unchanged cache.
+            UpdateDriveCacheHeader(letter);
+        }
+        // else: loaded straight from cache with no catch-up - the file already matches memory,
+        // so rewriting it (which used to happen on every warm startup) is pure waste.
     }
 }
 
@@ -371,7 +411,7 @@ void IndexManager::IndexOneDriveRawMft(wchar_t letter, DriveIndexStatus& status,
     if (!result.success) {
         if (result.accessDenied) {
             status.requiresElevation = true;
-            status.errors.push_back(L"Raw MFT scan needs Administrator privileges; using NTFS USN scan instead.");
+            status.errors.push_back(L"Raw MFT scan denied; using NTFS USN scan instead. (" + result.failureReason + L")");
         } else {
             status.errors.push_back(L"Raw MFT scan unavailable; using NTFS USN scan instead. (" + result.failureReason + L")");
         }
@@ -467,30 +507,76 @@ void IndexManager::IndexOneDriveRecursive(wchar_t letter, DriveIndexStatus& stat
     status.indexingMethod = L"Recursive";
 }
 
-bool IndexManager::TryIncrementalUpdate(wchar_t letter, DriveIndexStatus& status) {
+IndexManager::IncrementalResult IndexManager::TryIncrementalUpdate(wchar_t letter, size_t* appliedChangeCount) {
+    if (appliedChangeCount != nullptr) *appliedChangeCount = 0;
+
+    // Snapshot the journal identity under a brief lock. The journal read itself must run
+    // unlocked: it is disk I/O that can take a while, and the UI thread takes shared locks on
+    // every status-bar update -- holding the write lock across the read froze the whole window.
+    DWORDLONG journalId = 0;
+    USN startUsn = 0;
+    {
+        std::shared_lock lock(m_mutex);
+        auto* status = FindStatusLocked(letter);
+        if (status == nullptr || !status->indexed || !status->hasUsnJournal) {
+            return IncrementalResult::NotApplicable;
+        }
+        journalId = status->usnJournalId;
+        startUsn = status->lastProcessedUsn;
+    }
+
     auto cancelPredicate = [this]() { return IsCancelled(); };
-    auto result = UsnIncrementalUpdater::ReadChanges(letter, status.usnJournalId, status.lastProcessedUsn, cancelPredicate);
+    auto result = UsnIncrementalUpdater::ReadChanges(letter, journalId, startUsn, cancelPredicate);
+
+    std::unique_lock lock(m_mutex);
+    auto* status = FindStatusLocked(letter);
+    if (status == nullptr) return IncrementalResult::NotApplicable;
 
     if (!result.success) {
-        status.errors.push_back(L"Incremental update failed; falling back to full rebuild.");
-        return false;
+        status->errors.push_back(L"Incremental update failed; falling back to full rebuild.");
+        return IncrementalResult::Failed;
     }
     if (result.journalInvalidated) {
-        status.errors.push_back(L"Journal changed; full rebuild required.");
-        return false;
+        status->errors.push_back(L"Journal changed; full rebuild required.");
+        return IncrementalResult::Failed;
     }
 
     auto dataIt = m_driveData.find(letter);
     if (dataIt == m_driveData.end() || !dataIt->second.reconstructor) {
-        return false; // nothing to update incrementally against
+        // Journal is readable but there's no FRN graph to apply it to (e.g. the index was built
+        // by a recursive scan): treat as a failure so callers rebuild rather than trust it.
+        return IncrementalResult::Failed;
     }
     DriveData& data = dataIt->second;
+
+    // FRN -> position in data.items, built once so each change applies in O(1). The previous
+    // linear scan per change made large refreshes quadratic (changes x items).
+    std::unordered_map<uint64_t, size_t> itemIndexByFrn;
+    itemIndexByFrn.reserve(data.items.size());
+    for (size_t i = 0; i < data.items.size(); ++i) {
+        itemIndexByFrn[data.items[i].fileReferenceNumber] = i;
+    }
+
+    // Resolved paths are memoized across calls, so drop the cache up front; otherwise a
+    // renamed or moved item would resolve to its stale pre-rename path.
+    if (!result.changes.empty()) {
+        data.reconstructor->Clear();
+    }
 
     for (const auto& change : result.changes) {
         if (change.kind == UsnIncrementalUpdater::ChangeKind::Deleted) {
             data.nodes.erase(change.frn);
-            data.items.erase(std::remove_if(data.items.begin(), data.items.end(),
-                [&](const IndexedItem& it) { return it.fileReferenceNumber == change.frn; }), data.items.end());
+            auto it = itemIndexByFrn.find(change.frn);
+            if (it != itemIndexByFrn.end()) {
+                size_t idx = it->second;
+                itemIndexByFrn.erase(it);
+                size_t lastIdx = data.items.size() - 1;
+                if (idx != lastIdx) {
+                    data.items[idx] = std::move(data.items[lastIdx]);
+                    itemIndexByFrn[data.items[idx].fileReferenceNumber] = idx;
+                }
+                data.items.pop_back();
+            }
             continue;
         }
 
@@ -500,10 +586,9 @@ bool IndexManager::TryIncrementalUpdate(wchar_t letter, DriveIndexStatus& status
         node.attributes = change.attributes;
         data.nodes[change.frn] = node;
 
-        auto existing = std::find_if(data.items.begin(), data.items.end(),
-            [&](const IndexedItem& it) { return it.fileReferenceNumber == change.frn; });
+        auto existingIt = itemIndexByFrn.find(change.frn);
 
-        IndexedItem item = (existing != data.items.end()) ? *existing : IndexedItem{};
+        IndexedItem item = (existingIt != itemIndexByFrn.end()) ? data.items[existingIt->second] : IndexedItem{};
         item.fileReferenceNumber = change.frn;
         item.parentFileReferenceNumber = change.parentFrn;
         item.name = change.name;
@@ -517,18 +602,19 @@ bool IndexManager::TryIncrementalUpdate(wchar_t letter, DriveIndexStatus& status
 
         // Only this item's own path is recomputed; descendants of a renamed folder keep their
         // previously resolved path until the next full rebuild (see UsnIncrementalUpdater.h).
-        data.reconstructor->Resolve(change.frn, data.nodes, &item.diagnostics);
-        item.fullPath = data.reconstructor->Resolve(change.frn, data.nodes, nullptr);
+        item.fullPath = data.reconstructor->Resolve(change.frn, data.nodes, &item.diagnostics);
 
-        if (existing != data.items.end()) {
-            *existing = std::move(item);
+        if (existingIt != itemIndexByFrn.end()) {
+            data.items[existingIt->second] = std::move(item);
         } else {
+            itemIndexByFrn[change.frn] = data.items.size();
             data.items.push_back(std::move(item));
         }
     }
 
-    status.lastProcessedUsn = result.nextUsn;
-    return true;
+    status->lastProcessedUsn = result.nextUsn;
+    if (appliedChangeCount != nullptr) *appliedChangeCount = result.changes.size();
+    return IncrementalResult::Applied;
 }
 
 std::wstring IndexManager::CacheFilePath(wchar_t letter) const {
@@ -584,9 +670,19 @@ void IndexManager::SaveDriveCache(wchar_t letter) {
     }
 }
 
-bool IndexManager::LoadDriveCache(wchar_t letter, DriveIndexStatus& status) {
+bool IndexManager::LoadDriveCache(wchar_t letter) {
     std::wstring path = CacheFilePath(letter);
     if (path.empty()) return false;
+
+    // Only the volume serial is needed up front (to validate cache identity); everything until
+    // the final install runs without the lock so the UI stays responsive during a large load.
+    DWORD expectedSerial = 0;
+    {
+        std::shared_lock lock(m_mutex);
+        auto* status = FindStatusLocked(letter);
+        if (status == nullptr) return false;
+        expectedSerial = status->volumeSerialNumber;
+    }
 
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
@@ -612,7 +708,7 @@ bool IndexManager::LoadDriveCache(wchar_t letter, DriveIndexStatus& status) {
     }
 
     // Cache identity must match the live volume, otherwise it's stale (different disk/format).
-    if (towupper(cachedLetter) != towupper(letter) || serial != status.volumeSerialNumber) {
+    if (towupper(cachedLetter) != towupper(letter) || serial != expectedSerial) {
         return false;
     }
 
@@ -657,17 +753,54 @@ bool IndexManager::LoadDriveCache(wchar_t letter, DriveIndexStatus& status) {
         data.reconstructor = std::make_unique<PathReconstructor>(std::wstring(1, letter) + L":\\");
     }
 
+    std::unique_lock lock(m_mutex);
+    auto* status = FindStatusLocked(letter);
+    if (status == nullptr) return false;
+
+    size_t loadedCount = data.items.size();
+    // The cache doesn't record which method built it, but the per-item source string does; a
+    // warm start should report the real method rather than "(not indexed yet)".
+    if (status->indexingMethod.empty() && !data.items.empty()) {
+        status->indexingMethod = data.items.front().source;
+    }
     m_driveData[towupper(letter)] = std::move(data);
 
-    status.usnJournalId = journalId;
-    status.lastProcessedUsn = lastUsn;
-    status.hasUsnJournal = hasJournal;
-    status.itemCount = m_driveData[towupper(letter)].items.size();
-    status.statusMessage = L"Indexed (from cache)";
-    status.lastIndexedTime = builtTime;
-    status.lastIndexedTimeKnown = builtTimeKnown;
+    // Marked indexed immediately (not just at the end of IndexOneDrive) so the journal
+    // catch-up that runs right after the load sees a live index to apply changes to.
+    status->indexed = true;
+    status->usnJournalId = journalId;
+    status->lastProcessedUsn = lastUsn;
+    status->hasUsnJournal = hasJournal;
+    status->itemCount = loadedCount;
+    status->statusMessage = L"Indexed (from cache)";
+    status->lastIndexedTime = builtTime;
+    status->lastIndexedTimeKnown = builtTimeKnown;
 
     return true;
+}
+
+void IndexManager::UpdateDriveCacheHeader(wchar_t letter) {
+    std::wstring path = CacheFilePath(letter);
+    if (path.empty()) return;
+
+    std::shared_lock lock(m_mutex);
+    auto* status = FindStatusLocked(letter);
+    if (status == nullptr) return;
+
+    // In-place overwrite of the fixed-size header; must mirror SaveDriveCache's layout exactly,
+    // and the item payload that follows is left untouched.
+    std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!out) return;
+
+    out.write(kCacheMagic, sizeof(kCacheMagic));
+    WriteRaw(out, kCacheVersion);
+    WriteRaw(out, letter);
+    WriteRaw(out, status->volumeSerialNumber);
+    WriteRaw(out, status->usnJournalId);
+    WriteRaw(out, status->lastProcessedUsn);
+    WriteRaw(out, status->hasUsnJournal);
+    WriteRaw(out, status->lastIndexedTime);
+    WriteRaw(out, status->lastIndexedTimeKnown);
 }
 
 void IndexManager::DeleteDriveCache(wchar_t letter) {

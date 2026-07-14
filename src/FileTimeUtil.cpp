@@ -81,4 +81,28 @@ std::wstring Format(const FILETIME& ft, bool known) {
     return buf;
 }
 
+std::wstring FormatAge(const FILETIME& ft, bool known) {
+    if (!known) return L"";
+    if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0) return L"";
+
+    ULARGE_INTEGER then{}, now{};
+    then.LowPart = ft.dwLowDateTime;
+    then.HighPart = ft.dwHighDateTime;
+    FILETIME nowFt = Now();
+    now.LowPart = nowFt.dwLowDateTime;
+    now.HighPart = nowFt.dwHighDateTime;
+    if (now.QuadPart < then.QuadPart) return L"";
+
+    const ULONGLONG ticksPerSecond = 10000000ULL;
+    ULONGLONG seconds = (now.QuadPart - then.QuadPart) / ticksPerSecond;
+
+    if (seconds < 60) return L"just now";
+    ULONGLONG minutes = seconds / 60;
+    if (minutes < 60) return std::to_wstring(minutes) + (minutes == 1 ? L" minute ago" : L" minutes ago");
+    ULONGLONG hours = minutes / 60;
+    if (hours < 24) return std::to_wstring(hours) + (hours == 1 ? L" hour ago" : L" hours ago");
+    ULONGLONG days = hours / 24;
+    return std::to_wstring(days) + (days == 1 ? L" day ago" : L" days ago");
+}
+
 } // namespace FileTimeUtil

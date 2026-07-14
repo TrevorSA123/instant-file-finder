@@ -32,10 +32,12 @@ set(SOURCES
     src/RecursiveFileScanner.cpp
     src/UsnIncrementalUpdater.cpp
     src/LiveSearchManager.cpp
+    src/IndexedSearchWorker.cpp
     src/SearchEngine.cpp
     src/QueryParser.cpp
     src/PathReconstructor.cpp
     src/MetadataEnricher.cpp
+    src/FolderSizeCalculator.cpp
     src/SettingsService.cpp
     src/Clipboard.cpp
     src/ShellHelpers.cpp
@@ -60,10 +62,12 @@ set(HEADERS
     src/RecursiveFileScanner.h
     src/UsnIncrementalUpdater.h
     src/LiveSearchManager.h
+    src/IndexedSearchWorker.h
     src/SearchEngine.h
     src/QueryParser.h
     src/PathReconstructor.h
     src/MetadataEnricher.h
+    src/FolderSizeCalculator.h
     src/SettingsService.h
     src/Clipboard.h
     src/ShellHelpers.h

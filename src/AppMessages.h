@@ -24,3 +24,13 @@ constexpr UINT WM_APP_LIVE_SEARCH_PROGRESS = WM_APP + 5;
 
 // Sent once when a live search finishes (or is superseded and the newest one finishes).
 constexpr UINT WM_APP_LIVE_SEARCH_COMPLETE = WM_APP + 6;
+
+// lParam = FolderSizeCalculator::ComputedResult* (heap-allocated by FolderSizeCalculator, freed
+// by MainWindow's handler).
+constexpr UINT WM_APP_FOLDER_SIZE_COMPUTED = WM_APP + 7;
+
+// lParam = IndexedSearchWorker::CompletedSearch* (heap-allocated by IndexedSearchWorker, freed by
+// MainWindow's handler). Sent once when an indexed search finishes (or is superseded and the
+// newest one finishes) - see IndexedSearchWorker for why indexed search needs a background thread
+// at all.
+constexpr UINT WM_APP_INDEXED_SEARCH_COMPLETE = WM_APP + 8;

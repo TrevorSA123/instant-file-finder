@@ -36,8 +36,13 @@ struct AppSettings {
     bool includeHiddenFiles = true;
     bool includeSystemFiles = false;
     bool avoidReparsePoints = true;
+    // Off by default: sizing a folder means recursively walking every descendant file, which can
+    // be slow for large trees. When enabled, this runs automatically (in the background) after
+    // each search for every folder in the results, so folders can be sorted by real size
+    // alongside files (see FolderSizeCalculator).
+    bool computeFolderSizes = false;
     uint32_t maxDisplayedResults = 10000;
-    uint32_t searchDebounceMs = 200;
+    uint32_t searchDebounceMs = 500;
     bool alwaysOnTop = false;
 
     // Warn once per drive per session when its index is older than this many days. 0 disables

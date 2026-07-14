@@ -80,6 +80,7 @@ AppSettings SettingsService::Load() {
     settings.includeHiddenFiles = FindBool(text, "IncludeHiddenFiles", settings.includeHiddenFiles);
     settings.includeSystemFiles = FindBool(text, "IncludeSystemFiles", settings.includeSystemFiles);
     settings.avoidReparsePoints = FindBool(text, "AvoidReparsePoints", settings.avoidReparsePoints);
+    settings.computeFolderSizes = FindBool(text, "ComputeFolderSizes", settings.computeFolderSizes);
     settings.maxDisplayedResults = FindUInt(text, "MaxDisplayedResults", settings.maxDisplayedResults);
     settings.searchDebounceMs = FindUInt(text, "SearchDebounceMs", settings.searchDebounceMs);
     settings.alwaysOnTop = FindBool(text, "AlwaysOnTop", settings.alwaysOnTop);
@@ -107,6 +108,7 @@ bool SettingsService::Save(const AppSettings& settings) {
     WriteBool(out, "IncludeHiddenFiles", settings.includeHiddenFiles, true);
     WriteBool(out, "IncludeSystemFiles", settings.includeSystemFiles, true);
     WriteBool(out, "AvoidReparsePoints", settings.avoidReparsePoints, true);
+    WriteBool(out, "ComputeFolderSizes", settings.computeFolderSizes, true);
     WriteUInt(out, "MaxDisplayedResults", settings.maxDisplayedResults, true);
     WriteUInt(out, "SearchDebounceMs", settings.searchDebounceMs, true);
     WriteBool(out, "AlwaysOnTop", settings.alwaysOnTop, true);

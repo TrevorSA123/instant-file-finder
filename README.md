@@ -2,7 +2,7 @@
 
 A small, fast, native Windows desktop utility for finding files and folders by name, path, extension, size, or date.
 
-This project started partly as a practical tool and partly as a learning exercise. I wanted to understand how NTFS file discovery works under the hood, especially raw MFT parsing and the USN journal, and see how close I could get to “instant” file searching without relying on Windows Search indexing.
+This project started partly as a practical tool and partly as a learning exercise. I wanted to understand how NTFS file discovery works under the hood, especially raw MFT parsing and the USN journal, and see how close I could get to "instant" file searching without relying on Windows Search indexing.
 
 The idea is simple: if the filesystem already has the metadata, then for many searches you should not need to wait for a slow recursive scan, or depend on Windows Search being enabled, up to date, or configured the way you want. This tool builds its own lightweight in-memory view of the filesystem, while still allowing live searching when no index has been built.
 
@@ -96,6 +96,10 @@ From the results list you can:
 * copy the selected path;
 * copy all results as tab-separated text;
 * delete a selected item to the Recycle Bin.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
 
 Delete is the only action that changes anything on disk, and it always asks for confirmation first. It uses the Recycle Bin, not permanent deletion.
 
@@ -261,7 +265,7 @@ Both Raw MFT and NTFS USN scanning build a map of:
 file reference number -> parent reference number, name, attributes
 ```
 
-`PathReconstructor` then rebuilds the full path by walking each item’s parent chain.
+`PathReconstructor` then rebuilds the full path by walking each item's parent chain.
 
 It uses caching and guards against cycles, corrupt chains, or missing parents.
 
@@ -373,7 +377,7 @@ Administrator rights are not required for normal use.
 
 5. Use **Index > Index Drives...** to review detected drives.
 
-   The dialog shows each drive’s type, filesystem, and indexing status. You can choose which drives to index and cycle the scan method per drive:
+   The dialog shows each drive's type, filesystem, and indexing status. You can choose which drives to index and cycle the scan method per drive:
 
    * Raw MFT
    * Fast NTFS USN
@@ -444,7 +448,7 @@ Unrecognized `key:value` style tokens are treated as literal text.
 * A `size:` filter only matches items whose size is already known.
 * The USN journal can be inactive, reset, or truncated between runs.
 * If the USN journal is not usable, the affected drive falls back to a full rebuild.
-* Renaming or moving a folder through the incremental USN update path refreshes that folder’s own entry, but not the cached paths of all previously indexed descendants until the next full rebuild.
+* Renaming or moving a folder through the incremental USN update path refreshes that folder's own entry, but not the cached paths of all previously indexed descendants until the next full rebuild.
 * Results are capped at a configurable maximum, 10,000 by default.
 * Indexed data can go stale until you refresh or rebuild the index.
 
@@ -536,7 +540,7 @@ These are the practical checks I use to make sure the main workflows still behav
 
     Confirm that the status bar reports truncation and suggests narrowing the query.
 
-21. Let an indexed drive’s cache become stale, or temporarily lower the staleness threshold in Preferences.
+21. Let an indexed drive's cache become stale, or temporarily lower the staleness threshold in Preferences.
 
     Restart the app and confirm that the stale-index warning appears once.
 

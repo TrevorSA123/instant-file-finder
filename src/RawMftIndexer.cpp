@@ -218,6 +218,95 @@ ParsedRecord ParseRecord(const BYTE* record, size_t recordSize) {
     return out;
 }
 
+// One contiguous physical extent of the MFT: a starting cluster (LCN) and a count of clusters.
+struct DataRun {
+    uint64_t startLcn = 0;
+    uint64_t clusterCount = 0;
+};
+
+// Parses the non-resident, unnamed $DATA attribute of MFT record 0 (the $MFT describing itself)
+// into the list of physical cluster runs that make up the whole MFT. This is what lets us read the
+// MFT straight off the volume - following its real on-disk extents, fragmentation included -
+// instead of opening \\.\X:\$MFT by name (which AV/endpoint software commonly blocks). Returns
+// false if record 0 isn't the expected shape. 'record' must already be fixed up.
+bool ParseMftDataRuns(const BYTE* record, size_t recordSize, std::vector<DataRun>& outRuns) {
+    ByteReader reader(record, recordSize);
+
+    DWORD magic = 0;
+    if (!reader.Read(0, magic) || magic != kFileRecordMagic) return false;
+
+    uint16_t firstAttrOffset = 0;
+    uint32_t bytesInUse = 0;
+    if (!reader.Read(0x14, firstAttrOffset) || !reader.Read(0x18, bytesInUse)) return false;
+    if (bytesInUse > recordSize) bytesInUse = static_cast<uint32_t>(recordSize);
+
+    size_t offset = firstAttrOffset;
+    while (offset + 8 <= bytesInUse) {
+        DWORD typeCode = 0, attrLen = 0;
+        if (!reader.Read(offset, typeCode)) return false;
+        if (typeCode == kAttrEndMarker) break;
+        if (!reader.Read(offset + 4, attrLen)) return false;
+        if (attrLen < 8 || offset + attrLen > recordSize) return false;
+
+        BYTE nonResident = 0, nameLength = 0;
+        reader.Read(offset + 8, nonResident);
+        reader.Read(offset + 9, nameLength);
+
+        if (typeCode == kAttrData && nonResident == 1 && nameLength == 0) {
+            uint16_t mappingPairsOffset = 0;
+            if (!reader.Read(offset + 0x20, mappingPairsOffset)) return false;
+
+            size_t runPos = offset + mappingPairsOffset;
+            const size_t runEnd = offset + attrLen;
+            uint64_t currentLcn = 0;
+            while (runPos < runEnd) {
+                BYTE header = 0;
+                if (!reader.Read(runPos, header)) return false;
+                if (header == 0) break; // end of the run list
+                ++runPos;
+
+                size_t lenBytes = header & 0x0F;
+                size_t offBytes = (header >> 4) & 0x0F;
+                if (lenBytes == 0 || lenBytes > 8 || offBytes > 8) return false;
+
+                uint64_t runLength = 0;
+                for (size_t i = 0; i < lenBytes; ++i) {
+                    BYTE b = 0;
+                    if (!reader.Read(runPos + i, b)) return false;
+                    runLength |= static_cast<uint64_t>(b) << (8 * i);
+                }
+                runPos += lenBytes;
+
+                if (offBytes == 0) {
+                    // Sparse run (a hole) - no physical clusters. The MFT's own $DATA isn't
+                    // sparse in practice; skip rather than emit a bogus extent.
+                    continue;
+                }
+
+                int64_t delta = 0;
+                for (size_t i = 0; i < offBytes; ++i) {
+                    BYTE b = 0;
+                    if (!reader.Read(runPos + i, b)) return false;
+                    delta |= static_cast<int64_t>(b) << (8 * i);
+                }
+                // The run offset is a signed delta from the previous run's LCN; sign-extend it.
+                if (offBytes < 8) {
+                    int64_t signBit = static_cast<int64_t>(1) << (offBytes * 8 - 1);
+                    if (delta & signBit) delta |= -(static_cast<int64_t>(1) << (offBytes * 8));
+                }
+                runPos += offBytes;
+
+                currentLcn = static_cast<uint64_t>(static_cast<int64_t>(currentLcn) + delta);
+                if (runLength > 0) outRuns.push_back({ currentLcn, runLength });
+            }
+            return !outRuns.empty();
+        }
+
+        offset += attrLen;
+    }
+    return false;
+}
+
 } // namespace
 
 RawMftIndexer::Result RawMftIndexer::BuildIndex(wchar_t driveLetter, const CancelPredicate& isCancelled,
@@ -226,29 +315,12 @@ RawMftIndexer::Result RawMftIndexer::BuildIndex(wchar_t driveLetter, const Cance
 
     std::wstring volumePath = std::wstring(L"\\\\.\\") + driveLetter + L":";
     std::wstring driveRoot = std::wstring(1, driveLetter) + L":\\";
-    std::wstring mftPath = std::wstring(L"\\\\.\\") + driveLetter + L":\\$MFT";
 
-    // Enabling SeBackupPrivilege is what lets an elevated process open $MFT directly; a non-
-    // elevated process's token won't have the privilege available to enable, and the later
-    // CreateFileW call will fail with access denied, which is reported normally below.
-    {
-        HANDLE rawToken = nullptr;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &rawToken)) {
-            UniqueHandle token(rawToken);
-            TOKEN_PRIVILEGES priv{};
-            if (LookupPrivilegeValueW(nullptr, SE_BACKUP_NAME, &priv.Privileges[0].Luid)) {
-                priv.PrivilegeCount = 1;
-                priv.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                AdjustTokenPrivileges(token.Get(), FALSE, &priv, sizeof(priv), nullptr, nullptr);
-                // A non-zero return from AdjustTokenPrivileges doesn't guarantee the privilege
-                // was actually granted (GetLastError() may still report
-                // ERROR_NOT_ALL_ASSIGNED); either way we just attempt the open below and trust
-                // its own success/failure.
-            }
-        }
-    }
-
-    // FSCTL_GET_NTFS_VOLUME_DATA needs a handle to the volume itself, separate from $MFT.
+    // Open the volume for raw reads. This needs an elevated (Administrator) token, but - unlike the
+    // older approach of opening \\.\X:\$MFT by name - it needs neither SeBackupPrivilege nor an
+    // open of the $MFT metadata file itself. Opening $MFT by name is commonly denied by AV/endpoint
+    // software (and some policies) even for a fully elevated, backup-privileged process; reading the
+    // MFT's clusters straight off this volume handle side-steps that entirely.
     UniqueHandle volume(CreateFileW(
         volumePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -277,19 +349,10 @@ RawMftIndexer::Result RawMftIndexer::BuildIndex(wchar_t driveLetter, const Cance
         result.nextUsn = journalData.NextUsn;
     }
 
-    UniqueHandle mft(CreateFileW(
-        mftPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-    if (!mft.IsValid()) {
-        DWORD err = GetLastError();
-        result.accessDenied = (err == ERROR_ACCESS_DENIED);
-        result.failureReason = L"Could not open " + mftPath + L": " + FormatUtil::FormatWin32Error(err);
-        return result;
-    }
-
     const DWORD recordSize = volData.BytesPerFileRecordSegment;
     const DWORD sectorSize = volData.BytesPerSector;
-    if (recordSize == 0 || sectorSize == 0 || recordSize > (16 * 1024)) {
+    const uint64_t bytesPerCluster = volData.BytesPerCluster;
+    if (recordSize == 0 || sectorSize == 0 || bytesPerCluster == 0 || recordSize > (16 * 1024)) {
         result.failureReason = L"Unexpected NTFS volume geometry; falling back.";
         return result;
     }
@@ -297,11 +360,35 @@ RawMftIndexer::Result RawMftIndexer::BuildIndex(wchar_t driveLetter, const Cance
     uint64_t mftValidBytes = static_cast<uint64_t>(volData.MftValidDataLength.QuadPart);
     uint64_t totalRecords = mftValidBytes / recordSize;
 
-    // Read in large sequential chunks (ReadFile on the $MFT handle walks it like a normal file;
-    // Windows resolves this to the underlying disk extents) rather than one record at a time,
-    // which is the main source of this method's speed advantage over FSCTL_ENUM_USN_DATA.
-    const size_t recordsPerChunk = (4 * 1024 * 1024) / recordSize;
-    std::vector<BYTE> chunk(static_cast<size_t>(recordsPerChunk) * recordSize);
+    // Raw volume reads must be sector-aligned in both offset and length. Cluster-aligned offsets
+    // and cluster-multiple lengths satisfy that (a cluster is a whole number of sectors), so we
+    // seek to LCN*bytesPerCluster and read in cluster-multiple chunks throughout.
+    auto readAt = [&](uint64_t byteOffset, BYTE* buf, DWORD length) -> bool {
+        LARGE_INTEGER li{};
+        li.QuadPart = static_cast<LONGLONG>(byteOffset);
+        if (!SetFilePointerEx(volume.Get(), li, nullptr, FILE_BEGIN)) return false;
+        DWORD got = 0;
+        return ReadFile(volume.Get(), buf, length, &got, nullptr) && got == length;
+    };
+
+    // Bootstrap: read MFT record 0 ($MFT itself) from its start cluster and parse its $DATA runs,
+    // which describe where the rest of the MFT physically lives (it can be fragmented).
+    uint64_t mftStartOffset = static_cast<uint64_t>(volData.MftStartLcn.QuadPart) * bytesPerCluster;
+    DWORD bootLen = ((recordSize + sectorSize - 1) / sectorSize) * sectorSize; // record 0, sector-padded
+    std::vector<BYTE> bootBuf(bootLen);
+    if (!readAt(mftStartOffset, bootBuf.data(), bootLen)) {
+        result.failureReason = L"Could not read $MFT record 0 from volume: " + FormatUtil::FormatWin32Error(GetLastError());
+        return result;
+    }
+    if (!ApplyFixup(bootBuf.data(), recordSize, sectorSize)) {
+        result.failureReason = L"$MFT record 0 failed fixup validation.";
+        return result;
+    }
+    std::vector<DataRun> runs;
+    if (!ParseMftDataRuns(bootBuf.data(), recordSize, runs)) {
+        result.failureReason = L"Could not parse $MFT data runs from record 0.";
+        return result;
+    }
 
     std::unordered_map<uint64_t, UsnNode> nodes;
     nodes.reserve(1 << 16);
@@ -317,67 +404,103 @@ RawMftIndexer::Result RawMftIndexer::BuildIndex(wchar_t driveLetter, const Cance
     };
     std::unordered_map<uint64_t, TimeInfo> times;
 
-    uint64_t recordIndex = 0;
+    uint64_t recordIndex = 0; // positional MFT record number; advances for every slot, valid or not
     uint64_t processed = 0;
 
-    while (recordIndex < totalRecords) {
-        if (isCancelled && isCancelled()) {
-            result.failureReason = L"Indexing cancelled.";
-            return result;
+    // Turns one record-sized slot into map entries. recordIndex is the record's position in the
+    // MFT (== its base file reference number) and advances here for every slot so the frn stays
+    // correct across chunk/run boundaries.
+    auto handleRecord = [&](BYTE* recordPtr) {
+        uint64_t thisIndex = recordIndex++;
+        if (!ApplyFixup(recordPtr, recordSize, sectorSize)) return;
+        ParsedRecord parsed = ParseRecord(recordPtr, recordSize);
+        if (!parsed.valid) return;
+
+        uint64_t frn = (static_cast<uint64_t>(parsed.sequenceNumber) << 48) | thisIndex;
+
+        // Reserved metadata files (record indexes 0-15: $MFT, $LogFile, the root directory, etc.)
+        // and the self-referencing root aren't meaningful search results, but the root's node is
+        // still kept in the map below so ordinary top-level files/folders can resolve their path.
+        bool isReserved = thisIndex < kReservedRecordCount;
+
+        UsnNode node;
+        node.parentFrn = parsed.parentFrn;
+        node.name = parsed.name;
+        node.attributes = parsed.hasStdAttributes ? parsed.stdAttributes : parsed.fileNameAttributes;
+        if (parsed.isDirectory) node.attributes |= FILE_ATTRIBUTE_DIRECTORY;
+        nodes[frn] = std::move(node);
+
+        if (!parsed.isDirectory) {
+            uint64_t size = parsed.hasDataSize ? parsed.dataSize : parsed.fileNameRealSize;
+            sizes[frn] = { size, true };
         }
 
-        DWORD toRead = static_cast<DWORD>(std::min<uint64_t>(chunk.size(), (totalRecords - recordIndex) * recordSize));
-        DWORD actuallyRead = 0;
-        if (!ReadFile(mft.Get(), chunk.data(), toRead, &actuallyRead, nullptr) || actuallyRead == 0) {
-            break; // EOF or a transient read error; stop with whatever was parsed so far
-        }
+        TimeInfo ti;
+        ti.created = parsed.createdTime;
+        ti.createdKnown = parsed.hasCreatedTime;
+        ti.modified = parsed.modifiedTime;
+        ti.modifiedKnown = parsed.hasModifiedTime;
+        times[frn] = ti;
 
-        DWORD wholeRecords = actuallyRead / recordSize;
-        for (DWORD i = 0; i < wholeRecords; ++i) {
-            BYTE* recordPtr = chunk.data() + static_cast<size_t>(i) * recordSize;
+        if (!isReserved) ++processed;
+    };
 
-            if (ApplyFixup(recordPtr, recordSize, sectorSize)) {
-                ParsedRecord parsed = ParseRecord(recordPtr, recordSize);
-                if (parsed.valid) {
-                    uint64_t frn = (static_cast<uint64_t>(parsed.sequenceNumber) << 48) | recordIndex;
+    // Walk the MFT's physical runs, reading in large cluster-aligned chunks. The MFT is one logical
+    // stream of fixed-size records, but a record can straddle a chunk (or run) boundary, so any
+    // trailing partial record is carried over and prepended to the next read.
+    const uint64_t chunkBytes = std::max<uint64_t>(bytesPerCluster,
+        (static_cast<uint64_t>(4 * 1024 * 1024) / bytesPerCluster) * bytesPerCluster);
+    std::vector<BYTE> readBuf(static_cast<size_t>(chunkBytes));
+    std::vector<BYTE> carry; // leftover bytes not yet forming a whole record
+    bool done = false;
 
-                    // Reserved metadata files (record indexes 0-15: $MFT, $LogFile, the root
-                    // directory, etc.) and the self-referencing root aren't meaningful search
-                    // results, but the root's node is still kept in the map below so ordinary
-                    // top-level files/folders can resolve their path up to it.
-                    bool isReserved = recordIndex < kReservedRecordCount;
+    for (const DataRun& run : runs) {
+        if (done) break;
+        uint64_t physOffset = run.startLcn * bytesPerCluster;
+        uint64_t bytesLeft = run.clusterCount * bytesPerCluster;
 
-                    UsnNode node;
-                    node.parentFrn = parsed.parentFrn;
-                    node.name = parsed.name;
-                    node.attributes = parsed.hasStdAttributes ? parsed.stdAttributes : parsed.fileNameAttributes;
-                    if (parsed.isDirectory) node.attributes |= FILE_ATTRIBUTE_DIRECTORY;
-                    nodes[frn] = std::move(node);
-
-                    if (!parsed.isDirectory) {
-                        uint64_t size = parsed.hasDataSize ? parsed.dataSize : parsed.fileNameRealSize;
-                        sizes[frn] = { size, true };
-                    }
-
-                    TimeInfo ti;
-                    ti.created = parsed.createdTime;
-                    ti.createdKnown = parsed.hasCreatedTime;
-                    ti.modified = parsed.modifiedTime;
-                    ti.modifiedKnown = parsed.hasModifiedTime;
-                    times[frn] = ti;
-
-                    if (!isReserved) {
-                        ++processed;
-                    }
-                }
+        while (bytesLeft > 0 && !done) {
+            if (isCancelled && isCancelled()) {
+                result.failureReason = L"Indexing cancelled.";
+                return result;
             }
-            // A fixup failure or an invalid/unusable record is simply skipped; it never crashes
-            // or aborts the overall scan.
+
+            DWORD toRead = static_cast<DWORD>(std::min<uint64_t>(readBuf.size(), bytesLeft));
+            if (!readAt(physOffset, readBuf.data(), toRead)) {
+                break; // transient read error in this run; stop with whatever was parsed so far
+            }
+            physOffset += toRead;
+            bytesLeft -= toRead;
+
+            // Parse directly out of readBuf when nothing is carried over (the common case, since a
+            // cluster is normally a whole number of records); otherwise splice the carry in front.
+            BYTE* data = nullptr;
+            size_t dataLen = 0;
+            if (carry.empty()) {
+                data = readBuf.data();
+                dataLen = toRead;
+            } else {
+                carry.insert(carry.end(), readBuf.data(), readBuf.data() + toRead);
+                data = carry.data();
+                dataLen = carry.size();
+            }
+
+            size_t pos = 0;
+            while (dataLen - pos >= recordSize) {
+                if (recordIndex >= totalRecords) { done = true; break; }
+                handleRecord(data + pos);
+                pos += recordSize;
+            }
+
+            size_t remaining = dataLen - pos;
+            if (carry.empty()) {
+                carry.assign(data + pos, data + pos + remaining);
+            } else {
+                carry.erase(carry.begin(), carry.begin() + pos);
+            }
         }
 
-        recordIndex += wholeRecords;
         if (onProgress) onProgress(processed);
-        if (actuallyRead < toRead) break; // short read: end of the file
     }
 
     // Build IndexedItems from the collected nodes, reconstructing full paths. Timestamps were

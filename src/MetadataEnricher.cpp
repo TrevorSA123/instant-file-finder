@@ -28,6 +28,17 @@ void MetadataEnricher::RequestEnrichment(std::vector<std::wstring> paths) {
     m_cv.notify_one();
 }
 
+void MetadataEnricher::RequestBulkEnrichment(std::vector<std::wstring> paths) {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_bulkQueue.clear();
+        for (auto& p : paths) {
+            m_bulkQueue.push_back(std::move(p));
+        }
+    }
+    m_cv.notify_one();
+}
+
 bool MetadataEnricher::TryGetCached(const std::wstring& fullPath, EnrichedResult& out) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_cache.find(fullPath);
@@ -41,11 +52,17 @@ void MetadataEnricher::WorkerLoop() {
         std::wstring path;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            m_cv.wait(lock, [this] { return m_shutdown.load() || !m_queue.empty(); });
-            if (m_shutdown.load() && m_queue.empty()) return;
-            if (m_queue.empty()) continue;
-            path = std::move(m_queue.front());
-            m_queue.pop_front();
+            m_cv.wait(lock, [this] { return m_shutdown.load() || !m_queue.empty() || !m_bulkQueue.empty(); });
+            if (m_shutdown.load() && m_queue.empty() && m_bulkQueue.empty()) return;
+            if (!m_queue.empty()) {
+                path = std::move(m_queue.front());
+                m_queue.pop_front();
+            } else if (!m_bulkQueue.empty()) {
+                path = std::move(m_bulkQueue.front());
+                m_bulkQueue.pop_front();
+            } else {
+                continue;
+            }
         }
 
         EnrichedResult result;

@@ -7,7 +7,7 @@
 namespace {
 
 constexpr wchar_t kClassName[] = L"InstantFileFinder_PreferencesDialog";
-constexpr int kCheckboxCount = 12;
+constexpr int kCheckboxCount = 13;
 
 enum ControlId : int {
     IDC_CHK_ENABLE_INDEXING = 300,
@@ -21,6 +21,7 @@ enum ControlId : int {
     IDC_CHK_INCLUDE_HIDDEN,
     IDC_CHK_INCLUDE_SYSTEM,
     IDC_CHK_AVOID_REPARSE,
+    IDC_CHK_COMPUTE_FOLDER_SIZES,
     IDC_CHK_ALWAYS_ON_TOP,
     IDC_EDIT_MAX_RESULTS,
     IDC_EDIT_DEBOUNCE,
@@ -42,7 +43,8 @@ struct Controls {
 const ControlId kCheckboxIds[kCheckboxCount] = {
     IDC_CHK_ENABLE_INDEXING, IDC_CHK_AUTO_INDEX_FIXED, IDC_CHK_INCLUDE_REMOVABLE, IDC_CHK_INCLUDE_NETWORK,
     IDC_CHK_FAST_USN_SCAN, IDC_CHK_RAW_MFT_SCAN, IDC_CHK_PERSIST_CACHE, IDC_CHK_INCREMENTAL_UPDATES,
-    IDC_CHK_INCLUDE_HIDDEN, IDC_CHK_INCLUDE_SYSTEM, IDC_CHK_AVOID_REPARSE, IDC_CHK_ALWAYS_ON_TOP,
+    IDC_CHK_INCLUDE_HIDDEN, IDC_CHK_INCLUDE_SYSTEM, IDC_CHK_AVOID_REPARSE, IDC_CHK_COMPUTE_FOLDER_SIZES,
+    IDC_CHK_ALWAYS_ON_TOP,
 };
 
 const wchar_t* kCheckboxLabels[kCheckboxCount] = {
@@ -57,6 +59,7 @@ const wchar_t* kCheckboxLabels[kCheckboxCount] = {
     L"Include hidden files",
     L"Include system files",
     L"Avoid reparse points",
+    L"Compute folder sizes (recursively sums each folder's contents; can be slow)",
     L"Always on top",
 };
 
@@ -66,7 +69,7 @@ void ApplyToSettings(Controls& c) {
         &c.settings->includeNetworkDrives, &c.settings->useFastNtfsUsnScan, &c.settings->useRawMftScan,
         &c.settings->persistIndexCache, &c.settings->useIncrementalUsnUpdates,
         &c.settings->includeHiddenFiles, &c.settings->includeSystemFiles,
-        &c.settings->avoidReparsePoints, &c.settings->alwaysOnTop,
+        &c.settings->avoidReparsePoints, &c.settings->computeFolderSizes, &c.settings->alwaysOnTop,
     };
     for (int i = 0; i < kCheckboxCount; ++i) {
         *fields[i] = (SendMessageW(c.checkboxes[i], BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -144,7 +147,7 @@ bool Show(HWND owner, HINSTANCE instance, AppSettings& settings) {
     controls.settings = &settings;
 
     int dpi = DpiUtil::GetDpiForWindowSafe(owner);
-    const int width = DpiUtil::Scale(480, dpi), height = DpiUtil::Scale(630, dpi);
+    const int width = DpiUtil::Scale(480, dpi), height = DpiUtil::Scale(660, dpi);
     RECT ownerRect{};
     GetWindowRect(owner, &ownerRect);
     int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - width) / 2;
@@ -165,7 +168,7 @@ bool Show(HWND owner, HINSTANCE instance, AppSettings& settings) {
         settings.enableIndexing, settings.autoIndexFixedNtfsDrives, settings.includeRemovableDrives,
         settings.includeNetworkDrives, settings.useFastNtfsUsnScan, settings.useRawMftScan, settings.persistIndexCache,
         settings.useIncrementalUsnUpdates, settings.includeHiddenFiles, settings.includeSystemFiles,
-        settings.avoidReparsePoints, settings.alwaysOnTop,
+        settings.avoidReparsePoints, settings.computeFolderSizes, settings.alwaysOnTop,
     };
 
     int curY = DpiUtil::Scale(15, dpi);

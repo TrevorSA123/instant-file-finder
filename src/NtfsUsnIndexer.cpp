@@ -137,9 +137,15 @@ NtfsUsnIndexer::Result NtfsUsnIndexer::BuildIndex(wchar_t driveLetter, const Can
                 node.base.parentFrn = parentFrn;
                 node.base.name = std::move(name);
                 node.base.attributes = rec->FileAttributes;
-                node.timestamp.dwLowDateTime = rec->TimeStamp.LowPart;
-                node.timestamp.dwHighDateTime = static_cast<DWORD>(rec->TimeStamp.HighPart);
-                node.hasTimestamp = true;
+                // A full-volume USN *enumeration* (FSCTL_ENUM_USN_DATA) isn't a real journal
+                // event, so its records carry a zero TimeStamp. Only treat the time as known when
+                // it's actually populated - otherwise we'd hand the search a modified time of
+                // "1601" that a date filter then rejects as older than everything.
+                if (rec->TimeStamp.QuadPart != 0) {
+                    node.timestamp.dwLowDateTime = rec->TimeStamp.LowPart;
+                    node.timestamp.dwHighDateTime = static_cast<DWORD>(rec->TimeStamp.HighPart);
+                    node.hasTimestamp = true;
+                }
 
                 nodes[frn] = std::move(node);
                 ++totalRecords;
@@ -156,9 +162,13 @@ NtfsUsnIndexer::Result NtfsUsnIndexer::BuildIndex(wchar_t driveLetter, const Can
                 node.base.parentFrn = parentFrn;
                 node.base.name = std::move(name);
                 node.base.attributes = rec->FileAttributes;
-                node.timestamp.dwLowDateTime = rec->TimeStamp.LowPart;
-                node.timestamp.dwHighDateTime = static_cast<DWORD>(rec->TimeStamp.HighPart);
-                node.hasTimestamp = true;
+                // See the V2 branch above: enumerated USN records carry a zero TimeStamp, so only
+                // mark the modified time known when it's actually present.
+                if (rec->TimeStamp.QuadPart != 0) {
+                    node.timestamp.dwLowDateTime = rec->TimeStamp.LowPart;
+                    node.timestamp.dwHighDateTime = static_cast<DWORD>(rec->TimeStamp.HighPart);
+                    node.hasTimestamp = true;
+                }
 
                 nodes[frn] = std::move(node);
                 ++totalRecords;

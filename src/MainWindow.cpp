@@ -16,7 +16,11 @@
 
 #include <commctrl.h>
 #include <algorithm>
+#include <cwctype>
+#include <set>
 #include <sstream>
+#include <string_view>
+#include <unordered_set>
 
 namespace {
 
@@ -58,6 +62,7 @@ MainWindow::MainWindow() = default;
 
 MainWindow::~MainWindow() {
     if (m_enricher) m_enricher->Shutdown();
+    if (m_folderSizeCalculator) m_folderSizeCalculator->Shutdown();
 }
 
 LRESULT CALLBACK MainWindow::StaticWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -118,11 +123,17 @@ LRESULT MainWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_APP_METADATA_ENRICHED:
             OnMetadataEnriched(reinterpret_cast<MetadataEnricher::EnrichedResult*>(lParam));
             return 0;
+        case WM_APP_FOLDER_SIZE_COMPUTED:
+            OnFolderSizeComputed(reinterpret_cast<FolderSizeCalculator::ComputedResult*>(lParam));
+            return 0;
         case WM_APP_LIVE_SEARCH_PROGRESS:
             OnLiveSearchUpdate(/*complete=*/false);
             return 0;
         case WM_APP_LIVE_SEARCH_COMPLETE:
             OnLiveSearchUpdate(/*complete=*/true);
+            return 0;
+        case WM_APP_INDEXED_SEARCH_COMPLETE:
+            OnIndexedSearchComplete(reinterpret_cast<IndexedSearchWorker::CompletedSearch*>(lParam));
             return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
@@ -190,7 +201,11 @@ void MainWindow::OnCreate(HWND hwnd) {
 
     m_indexManager.Initialize(hwnd);
     m_liveSearchManager.Initialize(hwnd);
+    m_indexedSearchWorker.Initialize(hwnd);
     m_enricher = std::make_unique<MetadataEnricher>(hwnd);
+    m_folderSizeCalculator = std::make_unique<FolderSizeCalculator>(hwnd);
+    m_folderSizeCalculator->SetIndexSizeLookup(
+        [this](const std::vector<std::wstring>& folderPaths) { return LookupFolderSizesFromIndex(folderPaths); });
 
     PopulateDriveFilterCombo();
 
@@ -213,7 +228,9 @@ void MainWindow::OnDestroy() {
     SettingsService::Save(m_settings);
     m_indexManager.CancelIndexing();
     m_liveSearchManager.CancelSearch();
+    m_indexedSearchWorker.CancelSearch();
     if (m_enricher) m_enricher->Shutdown();
+    if (m_folderSizeCalculator) m_folderSizeCalculator->Shutdown();
 }
 
 void MainWindow::CreateMenus() {
@@ -239,6 +256,12 @@ void MainWindow::CreateMenus() {
     AppendMenuW(indexMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(indexMenu, MF_STRING, ID_INDEX_RUN_AS_ADMIN, L"Run as Administrator...");
     AppendMenuW(m_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(indexMenu), L"Index");
+
+    // Elevation is fixed for the life of the process (there's no de-elevate), so this only needs
+    // to be set once here rather than refreshed on any later state change.
+    if (ShellHelpers::IsProcessElevated()) {
+        EnableMenuItem(m_menu, ID_INDEX_RUN_AS_ADMIN, MF_BYCOMMAND | MF_GRAYED);
+    }
 
     HMENU searchMenu = CreatePopupMenu();
     AppendMenuW(searchMenu, MF_STRING, ID_SEARCH_CLEAR, L"Clear Search");
@@ -460,6 +483,7 @@ void MainWindow::StartInitialIndexingIfConfigured() {
 
     if (!letters.empty()) {
         m_indexManager.StartIndexing(letters, /*forceRebuild=*/false, BuildIndexOptions());
+        UpdateStatusBar(); // reflect "indexing" and grey the index actions right away
     }
 }
 
@@ -645,12 +669,19 @@ void MainWindow::OnTimer(WPARAM id) {
     } else if (id == IDT_ENRICH_REPAINT) {
         KillTimer(m_hwnd, IDT_ENRICH_REPAINT);
         m_enrichRepaintPending = false;
-        InvalidateRect(m_listView, nullptr, FALSE);
+        if (m_sortColumn == 4 || m_sortColumn == 5 || m_sortColumn == 6) {
+            // Newly-arrived sizes/dates (file metadata or folder totals) can change the sort
+            // order; re-sort so the list reflects it instead of just repainting stale positions.
+            ApplyCurrentSort();
+            UpdateResultsListView();
+        } else {
+            InvalidateRect(m_listView, nullptr, FALSE);
+        }
     }
 }
 
 void MainWindow::ScheduleDebouncedSearch() {
-    UINT ms = m_settings.searchDebounceMs > 0 ? m_settings.searchDebounceMs : 200;
+    UINT ms = m_settings.searchDebounceMs > 0 ? m_settings.searchDebounceMs : 500;
     SetTimer(m_hwnd, IDT_SEARCH_DEBOUNCE, ms, nullptr);
 }
 
@@ -691,33 +722,43 @@ void MainWindow::RunSearch() {
 void MainWindow::RunIndexedSearch(const SearchOptions& parsed) {
     m_liveSearchManager.CancelSearch();
 
-    DWORD startTick = GetTickCount();
-    SearchEngine::SearchOutcome outcome = SearchEngine::Execute(
-        [this](const std::function<void(const IndexedItem&)>& fn) { m_indexManager.ForEachItem(fn); },
-        parsed);
+    // Runs on a background thread rather than inline: when the size filter is on, PassesFilters
+    // may need to stat files whose size wasn't captured at index time (NTFS USN records don't
+    // carry it), which is real disk I/O and can take a while across a large index. See
+    // IndexedSearchWorker.
+    m_indexedSearchWorker.StartSearch(
+        parsed, [this](const std::function<void(const IndexedItem&)>& fn) { m_indexManager.ForEachItem(fn); });
+    UpdateStatusBar();
+}
 
-    m_lastSearchDurationMs = GetTickCount() - startTick;
-    m_lastSearchTruncated = outcome.truncated;
-    m_lastSearchTotalMatched = outcome.totalMatched;
+void MainWindow::OnIndexedSearchComplete(IndexedSearchWorker::CompletedSearch* result) {
+    std::unique_ptr<IndexedSearchWorker::CompletedSearch> owned(result);
+
+    m_lastSearchDurationMs = owned->durationMs;
+    m_lastSearchTruncated = owned->outcome.truncated;
+    m_lastSearchTotalMatched = owned->outcome.totalMatched;
     m_lastStatusOverride.clear();
 
-    if (outcome.queryError) {
-        ShowFriendlyMessage(outcome.errorMessage, MB_ICONWARNING);
+    if (owned->outcome.queryError) {
+        ShowFriendlyMessage(owned->outcome.errorMessage, MB_ICONWARNING);
     }
 
-    m_currentResults = std::move(outcome.results);
+    m_currentResults = std::move(owned->outcome.results);
     ApplyCurrentSort();
     UpdateResultsListView();
 
     RequestEnrichmentForVisibleRows();
+    RequestFolderSizesForResults();
     UpdateStatusBar();
 }
 
 void MainWindow::RunLiveSearch(const SearchOptions& parsed) {
-    bool hasCriteria = !parsed.query.empty() || !parsed.extensionFilter.empty() || !parsed.pathSubstring.empty();
+    bool hasCriteria = !parsed.query.empty() || !parsed.extensionFilter.empty() || !parsed.pathSubstring.empty() ||
+                        parsed.sizeFilterEnabled || parsed.modifiedDateFilterEnabled;
     if (!hasCriteria) {
         m_liveSearchManager.CancelSearch();
         m_currentResults.clear();
+        RebuildPathIndex();
         UpdateResultsListView();
         m_lastSearchTruncated = false;
         m_lastSearchTotalMatched = 0;
@@ -777,6 +818,7 @@ void MainWindow::OnLiveSearchUpdate(bool complete) {
     auto snapshot = m_liveSearchManager.GetSnapshot();
     size_t previousCount = m_currentResults.size();
     m_currentResults = std::move(snapshot.results);
+    RebuildPathIndex();
 
     m_lastSearchTruncated = snapshot.truncated;
     m_lastSearchTotalMatched = snapshot.totalMatched;
@@ -795,6 +837,7 @@ void MainWindow::OnLiveSearchUpdate(bool complete) {
         ApplyCurrentSort();
         UpdateResultsListView();
         m_lastSearchDurationMs = GetTickCount() - m_liveSearchStartTick;
+        RequestFolderSizesForResults();
     } else if (isContinuation) {
         AppendResultsToListView(previousCount);
     } else {
@@ -825,7 +868,21 @@ void MainWindow::AppendResultsToListView(size_t previousCount) {
 }
 
 void MainWindow::ApplyCurrentSort() {
-    if (m_currentResults.empty()) return;
+    if (m_currentResults.empty()) {
+        RebuildPathIndex();
+        return;
+    }
+
+    // The fast NTFS USN scan method (the common non-elevated path) never captures size or
+    // creation time - those are left unknown and normally only filled in lazily for visible
+    // rows. Sorting on an unknown value compares as "equal" for every row, so sorting by one of
+    // these columns silently did nothing after a USN-indexed search. Queue whatever's missing
+    // for the whole result set for background enrichment so the sort reflects real values once
+    // it arrives (see RequestMetadataForSort) - the sort below still runs immediately against
+    // whatever's already known/cached, and re-runs as results stream in (OnTimer).
+    if (m_sortColumn == 4 || m_sortColumn == 5 || m_sortColumn == 6) {
+        RequestMetadataForSort();
+    }
 
     int col = m_sortColumn;
     bool asc = m_sortAscending;
@@ -861,6 +918,46 @@ void MainWindow::ApplyCurrentSort() {
     };
 
     std::stable_sort(m_currentResults.begin(), m_currentResults.end(), cmp);
+    RebuildPathIndex();
+}
+
+void MainWindow::RequestMetadataForSort() {
+    if (!m_enricher) return;
+
+    std::vector<std::wstring> paths;
+    for (auto& item : m_currentResults) {
+        if (item.isDirectory) continue;
+        if (item.sizeKnown && item.modifiedTimeKnown && item.createdTimeKnown) continue;
+
+        // Already resolved (by an earlier search or the visible-rows queue) - apply from cache
+        // immediately instead of waiting on a round trip through the background worker.
+        MetadataEnricher::EnrichedResult cached;
+        if (m_enricher->TryGetCached(item.fullPath, cached) && cached.found) {
+            if (!item.sizeKnown && cached.sizeKnown) { item.size = cached.size; item.sizeKnown = true; }
+            if (!item.modifiedTimeKnown && cached.modifiedTimeKnown) {
+                item.modifiedTime = cached.modifiedTime;
+                item.modifiedTimeKnown = true;
+            }
+            if (!item.createdTimeKnown && cached.createdTimeKnown) {
+                item.createdTime = cached.createdTime;
+                item.createdTimeKnown = true;
+            }
+            continue;
+        }
+
+        paths.push_back(item.fullPath);
+    }
+    if (!paths.empty()) {
+        m_enricher->RequestBulkEnrichment(std::move(paths));
+    }
+}
+
+void MainWindow::RebuildPathIndex() {
+    m_pathIndex.clear();
+    m_pathIndex.reserve(m_currentResults.size());
+    for (size_t i = 0; i < m_currentResults.size(); ++i) {
+        m_pathIndex[m_currentResults[i].fullPath] = i;
+    }
 }
 
 void MainWindow::SortResultsBy(int column) {
@@ -884,13 +981,112 @@ void MainWindow::RequestEnrichmentForVisibleRows() {
     std::vector<std::wstring> paths;
     for (int i = std::max(0, top); i < last; ++i) {
         const auto& item = m_currentResults[static_cast<size_t>(i)];
-        if (!item.sizeKnown || !item.modifiedTimeKnown || !item.createdTimeKnown) {
+        // Directories never get a known size (they don't have one), so excluding the size
+        // check for them avoids re-queuing every visible folder for enrichment on every
+        // call. Without this, folders were perpetually "not yet enriched", which kept
+        // re-triggering OnMetadataEnriched -> repaint on every live search tick, flickering
+        // the results while a search was running.
+        bool needsSize = !item.isDirectory && !item.sizeKnown;
+        if (needsSize || !item.modifiedTimeKnown || !item.createdTimeKnown) {
             paths.push_back(item.fullPath);
         }
     }
     if (!paths.empty()) {
         m_enricher->RequestEnrichment(std::move(paths));
     }
+}
+
+void MainWindow::RequestFolderSizesForResults() {
+    if (!m_folderSizeCalculator || !m_settings.computeFolderSizes) return;
+
+    std::vector<std::wstring> toCompute;
+    for (auto& item : m_currentResults) {
+        if (!item.isDirectory || item.sizeKnown) continue;
+
+        // Folders sized by an earlier search are already cached - fill those in immediately
+        // instead of waiting for a round trip through the background worker.
+        uint64_t cachedSize = 0;
+        if (m_folderSizeCalculator->TryGetCached(item.fullPath, cachedSize)) {
+            item.size = cachedSize;
+            item.sizeKnown = true;
+        } else {
+            item.sizePending = true;
+            toCompute.push_back(item.fullPath);
+        }
+    }
+
+    // Always call this, even with an empty list: it cancels any still-running computation left
+    // over from a previous search whose folders are no longer part of the current results.
+    m_folderSizeCalculator->RequestFolderSizes(std::move(toCompute), m_settings.avoidReparsePoints);
+}
+
+std::unordered_map<std::wstring, uint64_t> MainWindow::LookupFolderSizesFromIndex(
+    const std::vector<std::wstring>& folderPaths) const {
+    std::unordered_map<std::wstring, uint64_t> resolved;
+    if (folderPaths.empty()) return resolved;
+
+    // Only Raw MFT indexing captures real file sizes (see RawMftIndexer vs NtfsUsnIndexer), and
+    // only for drives currently marked as indexed - anything else falls straight through to the
+    // disk-walk fallback. GetDriveStatuses() takes its own lock, so this (and ForEachItem below)
+    // is safe to call from FolderSizeCalculator's background resolver thread.
+    std::set<wchar_t> eligibleDrives;
+    for (const auto& status : m_indexManager.GetDriveStatuses()) {
+        if (status.indexed && status.scanMethod == ScanMethod::RawMft && !status.driveRoot.empty()) {
+            eligibleDrives.insert(static_cast<wchar_t>(towupper(status.driveRoot[0])));
+        }
+    }
+    if (eligibleDrives.empty()) return resolved;
+
+    // Normalize each requested folder to a trailing-backslash prefix so "C:\Foo" doesn't wrongly
+    // match "C:\FooBar\file.txt", while keeping a way back to the caller's original path string
+    // for the result map's keys.
+    std::unordered_set<std::wstring> prefixSet;
+    std::unordered_map<std::wstring, std::wstring> normalizedToOriginal;
+    prefixSet.reserve(folderPaths.size());
+    for (const auto& p : folderPaths) {
+        if (p.empty() || !eligibleDrives.count(static_cast<wchar_t>(towupper(p[0])))) continue;
+        std::wstring prefix = p;
+        if (prefix.back() != L'\\') prefix += L'\\';
+        prefixSet.insert(prefix);
+        normalizedToOriginal[prefix] = p;
+    }
+    if (prefixSet.empty()) return resolved;
+
+    // Single pass over the whole index: for every indexed file, walk up its own ancestor chain
+    // checking each level against the requested folder set, rather than checking every file
+    // against every requested folder. A folder only ends up in 'sums' (and stays out of
+    // 'incomplete') if every file found under it has a known size - see the header comment on
+    // why that's required before trusting an index-derived total.
+    std::unordered_map<std::wstring, uint64_t> sums;
+    std::unordered_set<std::wstring> incomplete;
+
+    m_indexManager.ForEachItem([&](const IndexedItem& item) {
+        if (item.isDirectory) return;
+
+        std::wstring_view path = item.fullPath;
+        size_t pos = path.rfind(L'\\');
+        while (pos != std::wstring_view::npos) {
+            std::wstring dir(path.substr(0, pos + 1));
+            if (prefixSet.count(dir)) {
+                if (item.sizeKnown) {
+                    sums[dir] += item.size;
+                } else {
+                    incomplete.insert(dir);
+                }
+            }
+            if (pos == 0) break;
+            pos = path.rfind(L'\\', pos - 1);
+        }
+    });
+
+    for (const auto& kv : normalizedToOriginal) {
+        const std::wstring& prefix = kv.first;
+        if (incomplete.count(prefix)) continue;
+        auto it = sums.find(prefix);
+        if (it == sums.end()) continue; // nothing found under it: unindexed or genuinely unknown - fall back to walk
+        resolved[kv.second] = it->second;
+    }
+    return resolved;
 }
 
 void MainWindow::OnDriveStatusChanged(wchar_t) {
@@ -983,15 +1179,19 @@ void MainWindow::OnMetadataEnriched(MetadataEnricher::EnrichedResult* resultPtr)
     std::unique_ptr<MetadataEnricher::EnrichedResult> result(resultPtr);
     if (!result->found) return;
 
+    // Looked up via m_pathIndex (O(1)) rather than a linear scan: this handler can now fire once
+    // per row for an entire large result set (RequestMetadataForSort's bulk queue), and a linear
+    // scan per arrival would turn that into an O(n^2) sweep of the UI thread.
     bool changed = false;
-    for (auto& item : m_currentResults) {
+    auto it = m_pathIndex.find(result->fullPath);
+    if (it != m_pathIndex.end() && it->second < m_currentResults.size()) {
+        auto& item = m_currentResults[it->second];
         if (item.fullPath == result->fullPath) {
             if (result->sizeKnown) { item.size = result->size; item.sizeKnown = true; }
             if (result->createdTimeKnown) { item.createdTime = result->createdTime; item.createdTimeKnown = true; }
             if (result->modifiedTimeKnown) { item.modifiedTime = result->modifiedTime; item.modifiedTimeKnown = true; }
             item.attributes = result->attributes;
             changed = true;
-            break;
         }
     }
     // Coalesce many rapid enrichment arrivals (one per visible row) into a single repaint a
@@ -1003,19 +1203,73 @@ void MainWindow::OnMetadataEnriched(MetadataEnricher::EnrichedResult* resultPtr)
     }
 }
 
+void MainWindow::OnFolderSizeComputed(FolderSizeCalculator::ComputedResult* resultPtr) {
+    std::unique_ptr<FolderSizeCalculator::ComputedResult> result(resultPtr);
+
+    // See OnMetadataEnriched for why this uses m_pathIndex instead of a linear scan: folder
+    // sizes are requested for every folder in the result set, not just visible ones.
+    bool changed = false;
+    auto it = m_pathIndex.find(result->folderPath);
+    if (it != m_pathIndex.end() && it->second < m_currentResults.size()) {
+        auto& item = m_currentResults[it->second];
+        if (item.isDirectory && item.fullPath == result->folderPath) {
+            item.size = result->size;
+            item.sizeKnown = true;
+            item.sizePending = false;
+            changed = true;
+        }
+    }
+    // Reuse the same coalesced-repaint timer as metadata enrichment: folder sizes can trickle in
+    // for a while after a search completes, and batching those into one repaint (with a resort
+    // if currently sorted by size) avoids the same per-item flicker fixed for file metadata.
+    if (changed && !m_enrichRepaintPending) {
+        m_enrichRepaintPending = true;
+        SetTimer(m_hwnd, IDT_ENRICH_REPAINT, 60, nullptr);
+    }
+}
+
+void MainWindow::UpdateIndexingControls() {
+    bool indexing = m_indexManager.IsIndexing();
+
+    // Grey the actions that would start a second scan while one is running (the Refresh button and
+    // its menu equivalents), and enable Cancel only while there's actually something to cancel.
+    EnableWindow(m_btnRefresh, indexing ? FALSE : TRUE);
+    UINT startFlags = MF_BYCOMMAND | (indexing ? MF_GRAYED : MF_ENABLED);
+    EnableMenuItem(m_menu, ID_INDEX_DRIVES, startFlags);
+    EnableMenuItem(m_menu, ID_INDEX_REFRESH, startFlags);
+    EnableMenuItem(m_menu, ID_INDEX_REBUILD, startFlags);
+    EnableMenuItem(m_menu, ID_INDEX_CANCEL, MF_BYCOMMAND | (indexing ? MF_ENABLED : MF_GRAYED));
+}
+
 void MainWindow::UpdateStatusBar(const wchar_t* extraMessage) {
+    UpdateIndexingControls();
+
     auto drives = m_indexManager.GetDriveStatuses();
     bool anyIndexing = m_indexManager.IsIndexing();
     bool liveSearching = !m_settings.enableIndexing && m_liveSearchManager.IsSearching();
+    bool indexedSearching = m_settings.enableIndexing && m_indexedSearchWorker.IsSearching();
     std::wstring currentDrive;
+    std::wstring currentPhase;
     uint64_t totalWarnings = 0;
     for (const auto& d : drives) {
-        if (d.indexing && currentDrive.empty()) currentDrive = d.driveRoot;
+        if (d.indexing && currentDrive.empty()) {
+            currentDrive = d.driveRoot;
+            currentPhase = d.statusMessage;
+        }
         totalWarnings += d.errors.size();
     }
 
-    std::wstring part0 = anyIndexing ? (L"Indexing" + (currentDrive.empty() ? std::wstring() : L" " + currentDrive))
-                          : liveSearching ? L"Searching..."
+    // While a drive is being indexed, its statusMessage names the actual phase (loading the
+    // cache, replaying journal changes, scanning); saying just "Indexing" during a warm-start
+    // cache load misled users into thinking a full scan was running.
+    std::wstring phaseLabel = L"Indexing";
+    if (!currentPhase.empty() && currentPhase != L"Indexing...") {
+        phaseLabel = currentPhase;
+        while (!phaseLabel.empty() && phaseLabel.back() == L'.') phaseLabel.pop_back();
+    }
+
+    std::wstring part0 = anyIndexing ? (phaseLabel + (currentDrive.empty() ? std::wstring() : L" " + currentDrive))
+                          : (liveSearching || indexedSearching) ? L"Searching..."
                           : (m_settings.enableIndexing ? L"Ready" : L"Ready (live search, no index)");
     std::wstring part1 = L"Indexed items: " + std::to_wstring(m_indexManager.TotalIndexedItemCount());
 
@@ -1103,7 +1357,9 @@ std::wstring MainWindow::FormatCell(const IndexedItem& item, int column) const {
         case 1: return item.fullPath;
         case 2: return item.isDirectory ? L"Folder" : L"File";
         case 3: return item.extension;
-        case 4: return FormatUtil::FormatSize(item.size, item.sizeKnown);
+        case 4:
+            if (!item.sizeKnown && item.sizePending) return L"Calculating...";
+            return FormatUtil::FormatSize(item.size, item.sizeKnown);
         case 5: return FileTimeUtil::Format(item.modifiedTime, item.modifiedTimeKnown);
         case 6: return FileTimeUtil::Format(item.createdTime, item.createdTimeKnown);
         case 7: return std::wstring(1, item.driveLetter) + L":";
@@ -1175,6 +1431,7 @@ void MainWindow::ActionDeleteSelected() {
     }
 
     m_currentResults.erase(m_currentResults.begin() + idx);
+    RebuildPathIndex();
     UpdateResultsListView();
     UpdateStatusBar();
 }
@@ -1245,12 +1502,16 @@ void MainWindow::ActionIndexDrives() {
                 SettingsService::Save(m_settings);
             }
             m_indexManager.StartIndexing(letters, /*forceRebuild=*/false, BuildIndexOptions());
+            UpdateStatusBar(); // reflect "indexing" and grey the index actions right away
         }
     }
 }
 
 void MainWindow::ActionRefreshIndex() {
-    if (m_indexManager.IsIndexing()) return;
+    if (m_indexManager.IsIndexing()) {
+        ShowFriendlyMessage(L"Indexing is already in progress. Wait for it to finish, or use Index > Cancel Indexing first.");
+        return;
+    }
 
     std::vector<wchar_t> letters;
     for (const auto& d : m_indexManager.GetDriveStatuses()) {
@@ -1262,10 +1523,14 @@ void MainWindow::ActionRefreshIndex() {
     }
     EnableIndexingIfNeeded();
     m_indexManager.StartIndexing(letters, /*forceRebuild=*/false, BuildIndexOptions());
+    UpdateStatusBar(); // reflect "indexing" and grey the index actions right away
 }
 
 void MainWindow::ActionRebuildIndex() {
-    if (m_indexManager.IsIndexing()) return;
+    if (m_indexManager.IsIndexing()) {
+        ShowFriendlyMessage(L"Indexing is already in progress. Wait for it to finish, or use Index > Cancel Indexing first.");
+        return;
+    }
 
     std::vector<wchar_t> letters;
     for (const auto& d : m_indexManager.GetDriveStatuses()) {
@@ -1277,6 +1542,7 @@ void MainWindow::ActionRebuildIndex() {
     }
     EnableIndexingIfNeeded();
     m_indexManager.RebuildDrives(letters, BuildIndexOptions());
+    UpdateStatusBar(); // reflect "indexing" and grey the index actions right away
 }
 
 void MainWindow::ActionCancelIndexing() {
@@ -1293,6 +1559,7 @@ void MainWindow::ActionClearCache() {
     m_indexManager.ClearAllCaches();
     m_warnedStaleDrives.clear();
     m_currentResults.clear();
+    RebuildPathIndex();
     UpdateResultsListView();
     UpdateStatusBar();
 }
@@ -1300,17 +1567,66 @@ void MainWindow::ActionClearCache() {
 void MainWindow::ActionShowIndexDetails() {
     auto drives = m_indexManager.GetDriveStatuses();
 
+    // Staleness is judged against the same threshold the post-indexing warning uses (see
+    // ComputeStaleDrives), so this dialog and that warning never disagree about what "old" means.
+    FILETIME now = FileTimeUtil::Now();
+    ULARGE_INTEGER nowLarge{};
+    nowLarge.LowPart = now.dwLowDateTime;
+    nowLarge.HighPart = now.dwHighDateTime;
+    const uint64_t ticksPerDay = 10000000ULL * 60ULL * 60ULL * 24ULL;
+
     std::wstring msg;
     bool any = false;
     for (const auto& d : drives) {
         if (d.driveRoot.empty()) continue;
-        // Only report on drives the user actually cares about: selected for indexing, or
-        // carrying leftover warnings from a previous attempt even if since deselected.
-        if (!d.selected && d.errors.empty()) continue;
+        // Only report on drives the user actually cares about: selected for indexing, still
+        // holding a searchable index, or carrying leftover warnings from a previous attempt
+        // even if since deselected.
+        if (!d.selected && !d.indexed && d.errors.empty()) continue;
 
         any = true;
-        msg += d.driveRoot + L" - " + (d.indexingMethod.empty() ? L"(not indexed yet)" : d.indexingMethod);
-        msg += d.indexed ? L", indexed\r\n" : L", not indexed\r\n";
+        msg += d.driveRoot;
+        if (!d.label.empty()) msg += L" \"" + d.label + L"\"";
+        if (!d.fileSystem.empty()) msg += L" (" + d.fileSystem + L")";
+        msg += L"\r\n";
+
+        msg += L"    Method: " + (d.indexingMethod.empty() ? L"(not indexed yet)" : d.indexingMethod) + L"\r\n";
+
+        std::wstring statusText = !d.statusMessage.empty() ? d.statusMessage
+                                   : d.indexing ? L"Indexing..."
+                                   : d.indexed ? L"Indexed" : L"Not indexed";
+        msg += L"    Status: " + statusText + L"\r\n";
+
+        if (d.indexed || d.itemCount > 0) {
+            msg += L"    Items: " + std::to_wstring(d.itemCount) + L"\r\n";
+        }
+
+        if (d.lastIndexedTimeKnown) {
+            msg += L"    Last indexed: " + FileTimeUtil::Format(d.lastIndexedTime, true);
+            std::wstring age = FileTimeUtil::FormatAge(d.lastIndexedTime, true);
+            if (!age.empty()) msg += L" (" + age + L")";
+
+            if (m_settings.indexStalenessWarningDays > 0) {
+                ULARGE_INTEGER indexedLarge{};
+                indexedLarge.LowPart = d.lastIndexedTime.dwLowDateTime;
+                indexedLarge.HighPart = d.lastIndexedTime.dwHighDateTime;
+                if (nowLarge.QuadPart > indexedLarge.QuadPart &&
+                    (nowLarge.QuadPart - indexedLarge.QuadPart) / ticksPerDay >= m_settings.indexStalenessWarningDays) {
+                    msg += L" - STALE, older than " + std::to_wstring(m_settings.indexStalenessWarningDays) +
+                           L" day(s); use Index > Refresh Index";
+                }
+            }
+            msg += L"\r\n";
+        } else if (d.indexed) {
+            msg += L"    Last indexed: unknown\r\n";
+        }
+
+        if (d.indexed) {
+            msg += d.hasUsnJournal
+                ? L"    Refresh: incremental (USN journal available)\r\n"
+                : L"    Refresh: full rescan (no USN journal for this index)\r\n";
+        }
+
         if (!d.downgradeReason.empty()) {
             msg += L"    " + d.downgradeReason + L"\r\n";
         }
@@ -1321,7 +1637,10 @@ void MainWindow::ActionShowIndexDetails() {
     }
 
     if (!any) {
-        msg = L"No index warnings or errors right now.";
+        msg = L"Nothing is indexed and no drives are selected for indexing.\r\n"
+              L"Use Index > Index Drives... to choose drives.";
+    } else {
+        msg += L"Total indexed items: " + std::to_wstring(m_indexManager.TotalIndexedItemCount()) + L"\r\n";
     }
 
     bool anyNeedsElevation = false;
